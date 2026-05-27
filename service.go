@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net"
 	"os"
+	"sync"
 
 	"github.com/anytls/sing-anytls/padding"
 	"github.com/anytls/sing-anytls/session"
@@ -21,6 +22,11 @@ import (
 )
 
 type Service struct {
+	// mu guards users. Added by the milou fork: upstream's UpdateUsers
+	// swapped s.users at runtime while NewConnection was reading it —
+	// concurrent map access under Go's memory model. UpdateUsers now
+	// takes the write lock; NewConnection snapshots under the read lock.
+	mu              sync.RWMutex
 	users           map[[32]byte]string
 	padding         atomic.TypedValue[*padding.PaddingFactory]
 	handler         N.TCPConnectionHandlerEx
@@ -69,7 +75,9 @@ func (s *Service) UpdateUsers(users []User) {
 	for _, user := range users {
 		u[sha256.Sum256([]byte(user.Password))] = user.Name
 	}
+	s.mu.Lock()
 	s.users = u
+	s.mu.Unlock()
 }
 
 // NewConnection `conn` should be plaintext
@@ -90,7 +98,12 @@ func (s *Service) NewConnection(ctx context.Context, conn net.Conn, source M.Soc
 	}
 	var passwordSha256 [32]byte
 	copy(passwordSha256[:], by)
-	if user, ok := s.users[passwordSha256]; ok {
+	// milou fork: snapshot the users map under the read lock — UpdateUsers
+	// swaps it at runtime for hot reload (see the struct comment).
+	s.mu.RLock()
+	users := s.users
+	s.mu.RUnlock()
+	if user, ok := users[passwordSha256]; ok {
 		ctx = auth.ContextWithUser(ctx, user)
 	} else {
 		b.Resize(0, n)

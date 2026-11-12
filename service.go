@@ -28,6 +28,13 @@ type Service struct {
 	// takes the write lock; NewConnection snapshots under the read lock.
 	mu              sync.RWMutex
 	users           map[[32]byte]string
+	// sessions holds the live session connections by the credential they
+	// authenticated with (milou fork, 2026-11-10). The password is checked
+	// once per session and every later stream rides on it, so a user removed
+	// from the roster (over quota, expired, password reset) kept full service
+	// until the client dropped the connection. UpdateUsers now closes the
+	// sessions whose credential is no longer on the roster. Guarded by mu.
+	sessions        map[[32]byte]map[net.Conn]struct{}
 	padding         atomic.TypedValue[*padding.PaddingFactory]
 	handler         N.TCPConnectionHandlerEx
 	fallbackHandler N.TCPConnectionHandlerEx
@@ -53,6 +60,7 @@ func NewService(config ServiceConfig) (*Service, error) {
 		fallbackHandler: config.FallbackHandler,
 		logger:          config.Logger,
 		users:           make(map[[32]byte]string),
+		sessions:        make(map[[32]byte]map[net.Conn]struct{}),
 	}
 
 	if service.handler == nil || service.logger == nil {
@@ -75,9 +83,67 @@ func (s *Service) UpdateUsers(users []User) {
 	for _, user := range users {
 		u[sha256.Sum256([]byte(user.Password))] = user.Name
 	}
+	// milou fork: swap the roster and pick the sessions it no longer covers
+	// under one lock, so a session can't authenticate against the old roster
+	// after the sweep (registration takes the same lock, see NewConnection).
+	var stale []net.Conn
 	s.mu.Lock()
 	s.users = u
+	for hash, conns := range s.sessions {
+		if _, ok := u[hash]; ok {
+			continue
+		}
+		for conn := range conns {
+			stale = append(stale, conn)
+		}
+		delete(s.sessions, hash)
+	}
 	s.mu.Unlock()
+	for _, conn := range stale {
+		_ = conn.Close()
+	}
+	if len(stale) > 0 {
+		s.logger.Info("anytls: closed ", len(stale), " session(s) of removed or re-keyed users")
+	}
+}
+
+// SessionCount returns the number of live authenticated sessions (milou fork).
+func (s *Service) SessionCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	n := 0
+	for _, conns := range s.sessions {
+		n += len(conns)
+	}
+	return n
+}
+
+// trackSession registers conn under its credential if that credential is on
+// the current roster, and returns the user name and an untrack func. Check and
+// registration happen under the write lock UpdateUsers holds while it sweeps.
+func (s *Service) trackSession(hash [32]byte, conn net.Conn) (string, func(), bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	user, ok := s.users[hash]
+	if !ok {
+		return "", nil, false
+	}
+	set := s.sessions[hash]
+	if set == nil {
+		set = make(map[net.Conn]struct{})
+		s.sessions[hash] = set
+	}
+	set[conn] = struct{}{}
+	return user, func() {
+		s.mu.Lock()
+		if set := s.sessions[hash]; set != nil {
+			delete(set, conn)
+			if len(set) == 0 {
+				delete(s.sessions, hash)
+			}
+		}
+		s.mu.Unlock()
+	}, true
 }
 
 // NewConnection `conn` should be plaintext
@@ -98,17 +164,16 @@ func (s *Service) NewConnection(ctx context.Context, conn net.Conn, source M.Soc
 	}
 	var passwordSha256 [32]byte
 	copy(passwordSha256[:], by)
-	// milou fork: snapshot the users map under the read lock — UpdateUsers
-	// swaps it at runtime for hot reload (see the struct comment).
-	s.mu.RLock()
-	users := s.users
-	s.mu.RUnlock()
-	if user, ok := users[passwordSha256]; ok {
-		ctx = auth.ContextWithUser(ctx, user)
-	} else {
+	// milou fork: check the credential and register the session in one step,
+	// under the lock UpdateUsers sweeps with (see trackSession), so a later
+	// roster change can close it.
+	user, untrack, ok := s.trackSession(passwordSha256, conn)
+	if !ok {
 		b.Resize(0, n)
 		return s.fallback(ctx, conn, source, E.New("unknown user password"), onClose)
 	}
+	defer untrack()
+	ctx = auth.ContextWithUser(ctx, user)
 	by, err = b.ReadBytes(2)
 	if err != nil {
 		b.Resize(0, n)
